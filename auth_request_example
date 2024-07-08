@@ -1,0 +1,110 @@
+# Nginx auth_request
+# https://docs.nginx.com/nginx/admin-guide/security-controls/configuring-subrequest-authentication/
+
+# Authenticated access to ElastiFlow
+location /elastiflow/ {
+		# Remove Authorization header to prevent client-side injection
+		#proxy_set_header Authorization "";
+
+		# Authenticate and authorize user
+		auth_request /auth_request/elastiflow/;
+		auth_request_set $auth_authorization $upstream_http_authorization;
+
+		# Insert some headers
+		proxy_set_header   Host                  $host;
+		proxy_set_header   X-Real-IP             $remote_addr;
+		proxy_set_header   X-Forwarded-For       $proxy_add_x_forwarded_for;
+		proxy_set_header   X-Forwarded-Host      $host;
+		proxy_set_header   X-Forwarded-Server    $host;
+		proxy_set_header   Authorization $auth_authorization;
+		client_max_body_size 100M;
+		proxy_read_timeout 120s;
+		proxy_pass         http://xxx.fi/elastiflow/;
+}
+
+# Authentication on subrequests
+location /auth_request/ {
+		internal;
+		proxy_pass                http://127.0.0.1:8000/session/auth_request/;
+		proxy_pass_request_body   off;
+		proxy_set_header          Content-Length "";
+		proxy_set_header          X-Original-URI $request_uri;
+}
+
+# Authenticated folder listing for ZTP configs
+location /ztp/ {
+		auth_request /auth_request/ztp_files/;
+		autoindex on;
+		alias /opt/ztp/ztp/;
+}
+
+...
+
+# Django auth_request view example
+
+# Provides endpoint for nginx auth_request authentication
+@never_cache
+def auth_request(request, resource = "root"):
+
+    # Default return code, overrided later
+    response = HttpResponse(status=403)
+
+    # Perform actual permission check for logged in users only
+    if request.user.is_authenticated:
+
+        # Response caching
+        cache_timeout = 30
+        cache_key = f"auth_request_{request.user}_{resource}"
+        cached_response = cache.get(cache_key, None)
+
+        # Log messages
+        auth_passed_message = f"User {request.user} passed auth_request on resource {resource}. Caching response for {cache_timeout}s."
+        auth_failed_message = f"User {request.user} failed auth_request on resource {resource}. Caching response for {cache_timeout}s."
+
+        if cached_response:
+            #logger.info(f"Returning cached auth_request response for key: {cache_key}")
+            return cached_response
+
+        # Direct access to folder listing for generated configs
+        if resource == "ztp_files":
+            if request.user.has_perm("auth.provision-device-all"):
+                logger.info(auth_passed_message)
+                response = HttpResponse(status=200)
+            else:
+                logger.warning(auth_failed_message)
+                response = HttpResponse(status=403)
+      
+            cache.add(cache_key, response, cache_timeout)
+            return response
+
+        # Single sign-on and access control for Elastiflow
+        elif resource == "elastiflow":
+
+            # Full admins to elastiflow
+            if request.user.has_perm("auth.elastiflow-admin"):
+                logger.info(auth_passed_message)
+                response = HttpResponse(status=200)
+                response["Authorization"] = settings.CUSTOM_CONFIG["ELASTIFLOW"]["admin_authorization"]
+
+            # Restricted users
+            elif request.user.has_perm("auth.elastiflow-view-all"):
+                logger.info(auth_passed_message)
+                response = HttpResponse(status=200)
+                response["Authorization"] = settings.CUSTOM_CONFIG["ELASTIFLOW"]["readonly_authorization"]
+
+            # No permission
+            else:
+                logger.info(auth_failed_message)
+                response = HttpResponse(status=403)
+
+            cache.add(cache_key, response, cache_timeout)
+            return response
+
+        # Invalid resource. If this happens, check the nginx configuration for the location
+        else:
+            logger.error(f"Invalid resource {resource} on auth_request")
+            return HttpResponse(status=403)
+
+    # Default return for non-authenticated users.
+    else:
+        return HttpResponse(status=403)
